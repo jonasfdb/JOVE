@@ -9,8 +9,8 @@ public class GeyserManager : MonoBehaviour
     // hard coded for debug this will be data driven eventually
     private const string TARGET_BODY = "Thatmo";
     private const float TRIGGER_RANGE_KM = 50f;
-    private const float MIN_INTERVAL = 20f;
-    private const float MAX_INTERVAL = 90f;
+    private const float MIN_INTERVAL = 12f;
+    private const float MAX_INTERVAL = 24f;
 
     private float _nextGeyserTime;
     private CelestialBody _targetBody;
