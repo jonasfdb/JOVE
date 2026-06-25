@@ -10,7 +10,7 @@ public class GeyserManager : MonoBehaviour
     private const string TARGET_BODY = "Thatmo";
     private const float TRIGGER_RANGE_KM = 50f;
     private const float MIN_INTERVAL = 12f;
-    private const float MAX_INTERVAL = 24f;
+    private const float MAX_INTERVAL = 24f; // TODO change before release
 
     private float _nextGeyserTime;
     private CelestialBody _targetBody;
@@ -57,9 +57,7 @@ public class GeyserManager : MonoBehaviour
 
     void SpawnGeyser()
     {
-        Vector3d vesselPos = FlightGlobals.ActiveVessel.CoMD;
-
-        // range in meters (min-max) from craft in which geyser can spawn
+        // range in meters from craft in which geyser can spawn
         float distance = UnityEngine.Random.Range(20f, 100f);
         float angle = UnityEngine.Random.Range(0f, 360f) * Mathf.Deg2Rad;
 
@@ -72,28 +70,28 @@ public class GeyserManager : MonoBehaviour
 
         double spawnLat = vesselLat + latOffset;
         double spawnLon = vesselLon + lonOffset;
-        double surfaceAltitude = 0;
+        double surfaceAltitude = 0.0;
 
         if (_targetBody.pqsController != null)
         {
             Vector3d nVector = _targetBody.GetRelSurfaceNVector(spawnLat, spawnLon);
             surfaceAltitude = _targetBody.pqsController.GetSurfaceHeight(nVector) - _targetBody.Radius;
 
-            if (double.IsNaN(surfaceAltitude) || surfaceAltitude < 0)
+            if (double.IsNaN(surfaceAltitude) || surfaceAltitude < 0.0)
                 surfaceAltitude = 0.0;
         }
+        Vector3d surfacePoint = _targetBody.GetWorldSurfacePosition(spawnLat, spawnLon, surfaceAltitude + 2.0);
 
-        // worldspace position and turn it upwards
-        Vector3d surfacePoint = _targetBody.GetWorldSurfacePosition(spawnLat, spawnLon, surfaceAltitude);
-        Vector3d surfaceNormal = (_targetBody.position - surfacePoint).normalized * -1;
+        // local up direction away from the body center
+        Vector3d surfaceNormal = (surfacePoint - _targetBody.position).normalized;
 
-        GameObject GeyserObj = new GameObject("JOVE_Geyser");
-        GeyserObj.transform.position = surfacePoint;
+        GameObject geyserObj = new GameObject("JOVE_Geyser");
 
-        // oh my god quaternions
-        GeyserObj.transform.rotation = Quaternion.FromToRotation(Vector3.forward, (Vector3)surfaceNormal);
+        // rotate
+        geyserObj.transform.position = surfacePoint;
+        geyserObj.transform.rotation = Quaternion.FromToRotation(Vector3.forward, (Vector3)surfaceNormal);
 
-        GeyserEffect effect = GeyserObj.AddComponent<GeyserEffect>();
+        GeyserEffect effect = geyserObj.AddComponent<GeyserEffect>();
         effect.Init(surfaceNormal);
 
         Debug.Log($"[JOVE.Geysers] Spawned Geyser at {spawnLat:F2}, {spawnLon:F2}");
@@ -102,83 +100,335 @@ public class GeyserManager : MonoBehaviour
 
 public class GeyserEffect : MonoBehaviour
 {
-    private ParticleSystem _ps;
-    private float _lifetime = 12f;  // how long geyser exists
+    private readonly List<ParticleSystem> _systems = new List<ParticleSystem>();
+
+    private float _lifetime = 18f;
     private float _age = 0f;
 
     public void Init(Vector3d surfaceNormal)
     {
-        _ps = gameObject.AddComponent<ParticleSystem>();
-        _ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);    // stop emitter before emitting otherwise it wont work
+        CreateCoreJet();
+        CreateMistCloud();
+        CreateBasePuff();
+        CreateIceFlecks();
 
-        // particle behavior
-        var main = _ps.main;
-        main.loop = false;
-        main.duration = 4f;           // how long to emit
-        main.startLifetime = 8f;      // lifetime after emission
-        main.startSpeed = 80f;        // start velocity m/s
-        main.startSize = new ParticleSystem.MinMaxCurve(5f, 20f);  // random size
-        main.startColor = new Color(0.85f, 0.9f, 1.0f, 0.6f);
-        main.gravityModifier = -0.05f; // negative for antigravity
-        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        foreach (ParticleSystem ps in _systems)
+        {
+            ps.Play();
+        }
+    }
 
-        // emission
-        var emission = _ps.emission;
-        emission.enabled = true;
-        emission.rateOverTime = new ParticleSystem.MinMaxCurve(30f);
+    private ParticleSystem CreateChildSystem(string name, Vector3 localPosition)
+    {
+        GameObject child = new GameObject(name);
+        child.transform.parent = transform;
+        child.transform.localPosition = localPosition;
+        child.transform.localRotation = Quaternion.identity;
 
-        // emitter shape
-        var shape = _ps.shape;
-        shape.enabled = true;
-        shape.shapeType = ParticleSystemShapeType.Cone;
-        shape.angle = 15f;  // cone angle
-        shape.radius = 3f;
+        ParticleSystem ps = child.AddComponent<ParticleSystem>();
+        ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
 
-        // particle movement
-        var vel = _ps.velocityOverLifetime;
-        vel.enabled = true;
-        vel.space = ParticleSystemSimulationSpace.Local;
-        vel.x = new ParticleSystem.MinMaxCurve(0f);
-        vel.y = new ParticleSystem.MinMaxCurve(0f);
-        vel.z = new ParticleSystem.MinMaxCurve(0f);
+        _systems.Add(ps);
+        return ps;
+    }
 
-        // particle visual
-        var col = _ps.colorOverLifetime;
-        col.enabled = true;
+    private void ConfigureRenderer(ParticleSystem ps)
+    {
+        ParticleSystemRenderer renderer = ps.GetComponent<ParticleSystemRenderer>();
+        renderer.renderMode = ParticleSystemRenderMode.Billboard;
+
+        Shader shader = Shader.Find("Legacy Shaders/Particles/Alpha Blended");
+
+        if (shader == null)
+            shader = Shader.Find("Particles/Alpha Blended");
+
+        if (shader != null)
+        {
+            renderer.material = new Material(shader);
+        }
+        else
+        {
+            Debug.LogWarning("[JOVE.Geysers] Could not find particle shader. Particle system may render incorrectly.");
+        }
+    }
+
+    private Gradient MakeGradient(
+        Color colorA,
+        Color colorB,
+        float alphaPeak,
+        float alphaMid)
+    {
         Gradient grad = new Gradient();
+
         grad.SetKeys(
-            new GradientColorKey[] {
-                new GradientColorKey(Color.white, 0f),
-                new GradientColorKey(Color.white, 1f)
+            new GradientColorKey[]
+            {
+                new GradientColorKey(colorA, 0f),
+                new GradientColorKey(colorB, 0.55f),
+                new GradientColorKey(colorA, 1f)
             },
-            new GradientAlphaKey[] {
-                new GradientAlphaKey(0f, 0f),       // start transparnt
-                new GradientAlphaKey(0.7f, 0.1f),   // fade in fast
-                new GradientAlphaKey(0.5f, 0.7f),
-                new GradientAlphaKey(0f, 1f)        // fade out
+            new GradientAlphaKey[]
+            {
+                new GradientAlphaKey(0f, 0f),
+                new GradientAlphaKey(alphaPeak, 0.08f),
+                new GradientAlphaKey(alphaMid, 0.65f),
+                new GradientAlphaKey(0f, 1f)
             }
         );
-        col.color = new ParticleSystem.MinMaxGradient(grad);
 
-        // make particles big
-        var size = _ps.sizeOverLifetime;
+        return grad;
+    }
+
+    private void CreateCoreJet()
+    {
+        ParticleSystem ps = CreateChildSystem("JOVE_Geyser_CoreJet", Vector3.zero);
+
+        // particle behavior
+        var main = ps.main;
+        main.loop = false;
+        main.duration = 5f;
+        main.startLifetime = new ParticleSystem.MinMaxCurve(3.5f, 7f);
+        main.startSpeed = new ParticleSystem.MinMaxCurve(90f, 160f);
+        main.startSize = new ParticleSystem.MinMaxCurve(3f, 9f);
+        main.startColor = new Color(0.75f, 0.9f, 1f, 0.55f);
+        main.gravityModifier = 0f;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 900;
+
+        // emission behavior
+        var emission = ps.emission;
+        emission.enabled = true;
+        emission.rateOverTime = new ParticleSystem.MinMaxCurve(65f);
+        emission.SetBursts(new ParticleSystem.Burst[]
+        {
+            new ParticleSystem.Burst(0f, (short)100),
+            new ParticleSystem.Burst(0.35f, (short)70),
+            new ParticleSystem.Burst(1.1f, (short)45)
+        });
+
+        // emitter shape
+        var shape = ps.shape;
+        shape.enabled = true;
+        shape.shapeType = ParticleSystemShapeType.Cone;
+        shape.angle = 7f;
+        shape.radius = 1.4f;
+
+        // particle lifetime behavior
+        var color = ps.colorOverLifetime;
+        color.enabled = true;
+        color.color = new ParticleSystem.MinMaxGradient(
+            MakeGradient(
+                new Color(0.7f, 0.9f, 1f),
+                Color.white,
+                0.55f,
+                0.22f
+            )
+        );
+
+        var size = ps.sizeOverLifetime;
         size.enabled = true;
         size.size = new ParticleSystem.MinMaxCurve(
             1f,
-            AnimationCurve.EaseInOut(0f, 0.2f, 1f, 1f)
+            AnimationCurve.EaseInOut(0f, 0.35f, 1f, 1.8f)
         );
 
-        // erupt!
-        _ps.Play();
+        var noise = ps.noise;
+        noise.enabled = true;
+        noise.strength = 4f;
+        noise.frequency = 0.35f;
+        noise.scrollSpeed = 0.4f;
+
+        ConfigureRenderer(ps);
+    }
+
+    private void CreateMistCloud()
+    {
+        // start the mist a little above the vent so it blooms around the upper plume
+        ParticleSystem ps = CreateChildSystem("JOVE_Geyser_MistCloud", new Vector3(0f, 0f, 25f));
+
+        var main = ps.main;
+        main.loop = false;
+        main.duration = 8f;
+        main.startLifetime = new ParticleSystem.MinMaxCurve(7f, 14f);
+        main.startSpeed = new ParticleSystem.MinMaxCurve(12f, 42f);
+        main.startSize = new ParticleSystem.MinMaxCurve(20f, 65f);
+        main.startColor = new Color(0.85f, 0.95f, 1f, 0.22f);
+        main.gravityModifier = 0f;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 700;
+
+        var emission = ps.emission;
+        emission.enabled = true;
+        emission.rateOverTime = new ParticleSystem.MinMaxCurve(35f);
+        emission.SetBursts(new ParticleSystem.Burst[]
+        {
+            new ParticleSystem.Burst(0.6f, (short)35),
+            new ParticleSystem.Burst(2.0f, (short)45)
+        });
+
+        var shape = ps.shape;
+        shape.enabled = true;
+        shape.shapeType = ParticleSystemShapeType.Cone;
+        shape.angle = 32f;
+        shape.radius = 7f;
+
+        var color = ps.colorOverLifetime;
+        color.enabled = true;
+        color.color = new ParticleSystem.MinMaxGradient(
+            MakeGradient(
+                new Color(0.75f, 0.9f, 1f),
+                Color.white,
+                0.22f,
+                0.09f
+            )
+        );
+
+        var size = ps.sizeOverLifetime;
+        size.enabled = true;
+        size.size = new ParticleSystem.MinMaxCurve(
+            1f,
+            AnimationCurve.EaseInOut(0f, 0.45f, 1f, 2.5f)
+        );
+
+        var noise = ps.noise;
+        noise.enabled = true;
+        noise.strength = 15f;
+        noise.frequency = 0.22f;
+        noise.scrollSpeed = 0.15f;
+
+        ConfigureRenderer(ps);
+    }
+
+    private void CreateBasePuff()
+    {
+        ParticleSystem ps = CreateChildSystem("JOVE_Geyser_BasePuff", Vector3.zero);
+
+        var main = ps.main;
+        main.loop = false;
+        main.duration = 1.5f;
+        main.startLifetime = new ParticleSystem.MinMaxCurve(2f, 5f);
+        main.startSpeed = new ParticleSystem.MinMaxCurve(8f, 28f);
+        main.startSize = new ParticleSystem.MinMaxCurve(10f, 34f);
+        main.startColor = new Color(0.9f, 0.97f, 1f, 0.32f);
+        main.gravityModifier = 0f;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 250;
+
+        var emission = ps.emission;
+        emission.enabled = true;
+        emission.rateOverTime = new ParticleSystem.MinMaxCurve(0f);
+        emission.SetBursts(new ParticleSystem.Burst[]
+        {
+            new ParticleSystem.Burst(0f, (short)90),
+            new ParticleSystem.Burst(0.45f, (short)45)
+        });
+
+        var shape = ps.shape;
+        shape.enabled = true;
+        shape.shapeType = ParticleSystemShapeType.Cone;
+        shape.angle = 75f;
+        shape.radius = 5f;
+
+        var color = ps.colorOverLifetime;
+        color.enabled = true;
+        color.color = new ParticleSystem.MinMaxGradient(
+            MakeGradient(
+                new Color(0.8f, 0.92f, 1f),
+                Color.white,
+                0.28f,
+                0.08f
+            )
+        );
+
+        var size = ps.sizeOverLifetime;
+        size.enabled = true;
+        size.size = new ParticleSystem.MinMaxCurve(
+            1f,
+            AnimationCurve.EaseInOut(0f, 0.7f, 1f, 1.8f)
+        );
+
+        var noise = ps.noise;
+        noise.enabled = true;
+        noise.strength = 8f;
+        noise.frequency = 0.5f;
+
+        ConfigureRenderer(ps);
+    }
+
+    private void CreateIceFlecks()
+    {
+        ParticleSystem ps = CreateChildSystem("JOVE_Geyser_IceFlecks", Vector3.zero);
+
+        var main = ps.main;
+        main.loop = false;
+        main.duration = 3f;
+        main.startLifetime = new ParticleSystem.MinMaxCurve(3f, 8f);
+        main.startSpeed = new ParticleSystem.MinMaxCurve(35f, 95f);
+        main.startSize = new ParticleSystem.MinMaxCurve(0.4f, 1.8f);
+        main.startColor = new Color(0.9f, 0.97f, 1f, 0.85f);
+        main.gravityModifier = 0f;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 180;
+
+        var emission = ps.emission;
+        emission.enabled = true;
+        emission.rateOverTime = new ParticleSystem.MinMaxCurve(8f);
+        emission.SetBursts(new ParticleSystem.Burst[]
+        {
+            new ParticleSystem.Burst(0f, (short)45),
+            new ParticleSystem.Burst(1.0f, (short)25)
+        });
+
+        var shape = ps.shape;
+        shape.enabled = true;
+        shape.shapeType = ParticleSystemShapeType.Cone;
+        shape.angle = 18f;
+        shape.radius = 2f;
+
+        var color = ps.colorOverLifetime;
+        color.enabled = true;
+
+        Gradient grad = new Gradient();
+        grad.SetKeys(
+            new GradientColorKey[]
+            {
+                new GradientColorKey(Color.white, 0f),
+                new GradientColorKey(new Color(0.65f, 0.85f, 1f), 1f)
+            },
+            new GradientAlphaKey[]
+            {
+                new GradientAlphaKey(0f, 0f),
+                new GradientAlphaKey(0.9f, 0.05f),
+                new GradientAlphaKey(0.65f, 0.65f),
+                new GradientAlphaKey(0f, 1f)
+            }
+        );
+
+        color.color = new ParticleSystem.MinMaxGradient(grad);
+
+        var size = ps.sizeOverLifetime;
+        size.enabled = true;
+        size.size = new ParticleSystem.MinMaxCurve(
+            1f,
+            AnimationCurve.EaseInOut(0f, 1.2f, 1f, 0.2f)
+        );
+
+        var noise = ps.noise;
+        noise.enabled = true;
+        noise.strength = 3f;
+        noise.frequency = 1.2f;
+
+        ConfigureRenderer(ps);
     }
 
     void Update()
     {
         _age += Time.deltaTime;
+
         if (_age >= _lifetime)
         {
             Destroy(gameObject);
-            // Destroy(marker, 10f);
+            // Destroy(markerObject);
         }
     }
 }
